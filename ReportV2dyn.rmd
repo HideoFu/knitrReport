@@ -1,0 +1,242 @@
+---
+title: "title"
+author: "author"
+date: "date"
+output: html_document
+---
+
+<!--- version 20170725 -->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, cache = TRUE)
+```
+
+```{r Lib, include=FALSE}
+library(org.Hs.eg.db)
+library(edgeR)
+library(stringr)
+library(DT)
+library(gplots)
+library(statmod)
+library(FactoMineR)
+
+library(knitr)
+library(rgl)
+knit_hooks$set(webgl = hook_webgl)
+```
+
+## Setup
+
+<!--- Write test conditions -->
+
+```{r TestCond}
+filename <- "result.csv"
+samples <- c("Cell1","Cell2","Cell3","Cell4")
+cond <- c("d0","d2","d8","d14")
+rept <- 2
+```
+
+```{r PlotEnv}
+topn <- 50    # number of genes in interest
+```
+
+<!--- Write test setup -->
+
+This test compares ``r length(samples)`` cell lines in ...
+Compared ``r length(cond)`` timepoints for each.
+
+## Results
+
+```{r AppA, fig.height= 12}
+data <- read.csv(filename)
+
+col1 <- grep("milliQ", colnames(data))
+col2 <- grep("Undetermined", colnames(data))
+col <- c(col1,col2)
+data <- data[,-col]
+data <- data[,c(1,6:ncol(data))]
+
+names <- paste(rep(samples,each=(length(cond)*rept)),rep(cond,each=rept),c(1:rept),sep="_")
+group <- as.factor(paste(rep(samples,each=(length(cond)*rept)),rep(cond,each=rept),sep="_"))
+colnames(data) <- c("symbol",names)
+
+buildDGE <- function(x, group,n=2){
+
+  egSYMBOL <- toTable(org.Hs.egSYMBOL)
+  m <- match(x$symbol,egSYMBOL$symbol) # 入力データの"symbol"カラムでマッチング
+  x$gene_id <- egSYMBOL[m,"gene_id"]
+  
+  keep <- !(is.na(x$gene_id))
+  x <- x[keep,]
+  i <- ncol(x)
+  x <- x[,c(1,i,2:(i-1))]
+  
+  y <- DGEList(counts=x[,3:i],genes=x[,1:2],group=group)
+  
+  rownames(y$counts) <- rownames(y$genes) <- y$genes$gene_id
+  y$genes$gene_id <- NULL
+  
+  keep <- rowSums(cpm(y)>1)>=n
+  y <- y[keep,,keep.lib.sizes=F]
+  
+  y <- calcNormFactors(y)
+  
+  invisible(y)
+}
+
+y <- buildDGE(data,group,n=rept)
+
+buildDesign <- function(y){
+  design <- model.matrix(~0+group, data=y$samples)
+  colnames(design) <- levels(y$samples$group)
+  
+  invisible(design)
+}
+
+design <- buildDesign(y)
+
+anovContrast <- function(design){
+
+	group <- attr(design,"dimnames")[[2]]
+	k <- length(group)
+
+	str <- character() 
+	str0 <- as.character()
+
+	for (i in 1:(k-1)){
+		for (j in (i+1):k){
+		str0 <- paste0(group[i],"vs",group[j]," = ",group[i]," - ",group[j])
+		str <- c(str, str0)
+		}
+	}
+
+	return(str)
+}
+
+str <- anovContrast(design)
+
+con <- makeContrasts(contrasts = str,levels=design)
+```
+Using `edgeR`[1], read counts are normalized with TMM method. Low expression (less than 2 sample has cpm > 1) genes were removed. The number of remaining gene is ``r nrow(y$genes)``.
+
+Samples were grouped by conditions (cellline, timepoint). All couples were compared gene expression fold change, and most significant ``r topn`` genes were seleced.
+
+<!--- Write findings about genes -->
+
+```{r Eval}
+y <- estimateDisp(y, design, robust = TRUE)
+
+fit <- glmQLFit(y, design, robust= TRUE)
+
+anov <- glmQLFTest(fit, contrast = con)
+top <- topTags(anov, n=topn)
+
+datatable <- top@.Data[[1]]
+splitres <- str_split(str,pattern=" ",simplify=TRUE)
+splitnames <- splitres[,1]
+colnames(datatable) <- c("symbol",splitnames,"logCPM","F","PValue","FDR")
+
+datatable(datatable)
+```
+
+```{r Heatmap1, fig.height=10, fig.width=12}
+mydist=function(c){dist(c,method="euclidian")}
+myclust=function(c){hclust(c,method="average")}
+
+# logFC Heatmap
+
+dim <- ncol(con)
+
+data <- as.matrix(datatable[,2:(dim+1)])
+
+heatmap.2(data, hclustfun=myclust, distfun=mydist, na.rm = TRUE, scale="none", dendrogram="both", margins=c(6,7), Rowv=TRUE, Colv=TRUE, symbreaks=TRUE, key=TRUE, symkey=FALSE, density.info="none", trace="none", main="log FC", cexRow=0.8, cexCol=0.7, labRow=datatable[,"symbol"],col=rev(redgreen(75)))
+```
+
+Selected genes were clustered with distance calculated with Euclidian method, and clustered with average.  
+Also log2(CPM) value were clusterd top ``r topn`` genes of each sample. 
+
+<!--- Write findings about heatmaps -->
+
+
+```{r Heatmap2, fig.height=10}
+# logCPM Heatmap
+
+m <- match(rownames(datatable),rownames(y$genes))
+datatable2 <- cpm(y)[m,]
+data <- log2(as.matrix(datatable2)+1)
+
+heatmap.2(data, hclustfun=myclust, distfun=mydist, na.rm = TRUE, scale="none", dendrogram="both", margins=c(6,7), Rowv=TRUE, Colv=TRUE, symbreaks=FALSE, key=TRUE, symkey=FALSE, density.info="none", trace="none", main="log CPM", cexRow=0.8, cexCol=0.9, labRow=datatable[,"symbol"],col=rev(heat.colors(75)))
+```
+
+The sample similarity was plotted with multidimensional scaling (MDS) method, and primary component analysis (PCA) with all ``r nrow(y$genes)`` genes. PCA plot was performed with `FactoMineR`[2]. 
+
+<!--- Write findings about similarity among samples -->
+
+
+```{r MDS}
+points <- rep(c(15, 16, 17, 18),4)
+colors <- rep(c("brown","darkorange","darkorchid","darkseagreen4"),each=4)
+plotMDS(y, col=colors[group],pch=points[group])
+legend("bottomleft",cex=0.7,legend=levels(group),pch=points,col=colors,ncol=4)
+```
+
+```{r Prep2}
+data2 <- cpm(y)
+rownames(data2) <- y$genes$symbol
+tdata <- as.data.frame(t(data2))
+tdata$cells <- as.factor(rep(samples,each=length(cond)*rept))
+tdata$cond <- as.factor(rep(rep(cond,each=rept),length(samples)))
+i = ncol(tdata)
+```
+
+```{r PCA, fig.height=8}
+res.pca <- PCA(tdata, graph = F, quali.sup = (i-1):i)
+plot(res.pca, habillage=(i-1),cex = 0.5)
+```
+
+```{r PCA3d, webgl=TRUE}
+data3d <- as.data.frame(res.pca$ind$coord)
+plot3d(data3d[,1:3])
+```
+
+### References
+1: *Robinson MD, McCarthy DJ and Smyth GK* **(2010).** edgeR: a Bioconductor package for differential expression analysis of digital gene expression data. *Bioinformatics* **26,** 139--140
+
+2: *Sebastien Le, Jullie Josse, Francois Husson* **(2008).** FactoMineR: An R Package for Multivariate Analysis. *Journal of Statistical Software,* **25(1),** 1--18. 10.18637/jss.v025.i01
+
+## Appendix
+### Source Code
+Sample Condition
+```{r TestCond, echo=TRUE, eval=FALSE}
+```
+Plot Environment
+```{r PlotEnv, echo=TRUE, eval=FALSE}
+```
+Data Preparation
+```{r AppA, echo=TRUE, eval=FALSE}
+```
+```{r Eval, echo=TRUE, eval=FALSE}
+```
+log FC Heatmap (ANOVA-like)
+```{r Heatmap1, echo=TRUE, eval=FALSE}
+```
+log CPM Heatmap
+```{r Heatmap2, echo=TRUE, eval=FALSE}
+```
+MDS Plot
+```{r MDS, echo=TRUE, eval=FALSE}
+```
+Data Preparation 2
+```{r Prep2, echo=TRUE, eval=FALSE}
+```
+PCA Plot
+```{r PCA, echo=TRUE, eval=FALSE}
+```
+3D PCA Plot
+```{r PCA3d, echo=TRUE, eval=FALSE}
+```
+
+### Session Info
+```{r info, echo=FALSE}
+sessionInfo()
+```
